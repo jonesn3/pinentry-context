@@ -19,6 +19,8 @@ Optional config: ~/.config/pinentry-context/config  (key = value)
   notify   = swaynag -t warning -m      command for "touch your security key"
                                         notices; the message is appended
   stop     = myterm, otherwise          extra process names to end the chain at
+  title_command = my-title-script       prints the window title for the pids
+                                        given as arguments (nearest first)
 """
 import os
 import shlex
@@ -91,16 +93,18 @@ def proc(pid):
 
 
 def describe(pid, conf=None):
+    conf = conf or {}
     stop = set(STOP)
-    if conf and conf.get("stop"):
+    if conf.get("stop"):
         stop |= {s.strip() for s in conf["stop"].split(",") if s.strip()}
     home = os.path.expanduser("~")
-    chain, cwd = [], None
+    chain, pids, cwd = [], [], None
     while pid > 1 and len(chain) < MAX_DEPTH:
         try:
             comm, ppid, cmd, pcwd = proc(pid)
         except (OSError, ValueError):
             break
+        pids.append(pid)
         if comm in stop:
             chain.append(f"[{comm}]")
             break
@@ -116,11 +120,116 @@ def describe(pid, conf=None):
         return "Requested by: unknown process"
     if cwd and (cwd == home or cwd.startswith(home + "/")):
         cwd = "~" + cwd[len(home):]
-    lines = [f"Requested from: {cwd or '?'}"]
+    lines = []
+    title = window_title(pids, conf)
+    if title:
+        lines.append(f"Window: {title}")
+    lines.append(f"Requested from: {cwd or '?'}")
     # outermost first, the direct requester last
     for depth, entry in enumerate(reversed(chain)):
         lines.append("  " * depth + ("└ " if depth else "") + entry)
     return "\n".join(lines)
+
+
+# --- Window title lookup ------------------------------------------------------
+#
+# A provider answers "which window does this request come from?" for one window
+# manager / desktop. To support another one, add a function below:
+#
+#   @title_provider
+#   def mywm_title(pids):
+#       ...
+#
+# `pids` is the requesting process chain, nearest first, ending at the terminal
+# (or wherever the chain stopped). Return the window title as a string, or None
+# if this provider does not apply (other desktop, no matching window). Providers
+# are tried in order; exceptions count as "does not apply", so an unsupported
+# desktop simply gets no "Window:" line. Keep them fast (<1s): the passphrase
+# prompt waits for them.
+
+TITLE_PROVIDERS = []
+TITLE_MAX = 80
+TITLE_TIMEOUT = 1.0     # seconds
+
+
+def title_provider(func):
+    TITLE_PROVIDERS.append(func)
+    return func
+
+
+def window_title(pids, conf):
+    """Title of the window the request comes from, or None."""
+    def clean(title):
+        title = "".join(c for c in (title or "") if c.isprintable()).strip()
+        if len(title) > TITLE_MAX:
+            title = title[:TITLE_MAX - 1] + "…"
+        return title or None
+
+    if conf.get("title_command"):       # user hook: gets the pids as arguments
+        try:
+            out = subprocess.run(
+                shlex.split(conf["title_command"]) + [str(p) for p in pids],
+                capture_output=True, text=True, timeout=TITLE_TIMEOUT,
+                stdin=subprocess.DEVNULL).stdout
+            title = clean(out.split("\n", 1)[0])
+            if title:
+                return title
+        except Exception:
+            pass
+    for provider in TITLE_PROVIDERS:
+        try:
+            title = clean(provider(pids))
+            if title:
+                return title
+        except Exception:
+            pass
+    return None
+
+
+@title_provider
+def sway_title(pids):
+    """sway: ask the compositor for its window tree over the IPC socket."""
+    import glob
+    import json
+    import socket
+    import struct
+    path = os.environ.get("SWAYSOCK")
+    if not path or not os.path.exists(path):
+        found = glob.glob(f"/run/user/{os.getuid()}/sway-ipc.*.sock")
+        if not found:
+            return None
+        path = found[0]
+
+    def read(sock, size):
+        data = b""
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
+        return data
+
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(TITLE_TIMEOUT)
+        sock.connect(path)
+        sock.sendall(b"i3-ipc" + struct.pack("=II", 0, 4))      # 4 = GET_TREE
+        length = struct.unpack("=II", read(sock, 14)[6:])[0]
+        tree = json.loads(read(sock, length))
+
+    windows = {}                        # pid -> title (focused one wins)
+
+    def walk(node):
+        pid, name = node.get("pid"), node.get("name")
+        if pid and name and (pid not in windows or node.get("focused")):
+            windows[pid] = name
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            walk(child)
+
+    walk(tree)
+    for pid in pids:                    # nearest process that owns a window
+        if pid in windows:
+            return windows[pid]
+    return None
 
 
 GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",

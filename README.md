@@ -9,6 +9,7 @@ passphrase blind or cancel something legitimate.
 ```
 Please enter the passphrase to unlock the OpenPGP secret key: ...
 
+Window: ◐ Fix typo in docs
 Requested from: ~/projects/some-repo
 [kitty]
   └ bash  (4711)
@@ -90,11 +91,48 @@ notify = swaynag -t warning -m
 
 # Extra process names (comma separated) where the chain should stop.
 stop = myterminal
+
+# Custom window title lookup, see "Window titles" below.
+title_command = ~/bin/my-window-title
 ```
 
 The chain stops at the first known terminal, multiplexer or session process, so
 it shows what happened inside the terminal rather than your whole login
 session.
+
+## Window titles
+
+The `Window:` line is the title of the window the request comes from, which
+helps when several terminals or agent sessions are open. It needs help from the
+window manager, so it is only shown where a lookup exists:
+
+| Desktop | Status |
+|---|---|
+| sway | built in |
+| anything else | no `Window:` line, everything else works |
+
+There are two ways to add another window manager or desktop:
+
+- **Without touching the code:** set `title_command` in the config file. The
+  command is called with the requesting process IDs as arguments (nearest
+  first, ending at the terminal) and prints the title on the first line of its
+  output. Print nothing if there is no match.
+- **In the code:** add a provider next to `sway_title` in `pinentry-context`:
+
+  ```python
+  @title_provider
+  def mywm_title(pids):
+      # return the title of the window owned by one of `pids`, or None
+      ...
+  ```
+
+  Providers are tried in order. Returning `None` or raising means "does not
+  apply here", so the line is skipped. Keep them under a second: the passphrase
+  prompt waits for them.
+
+A window is matched by process ID. A terminal that runs several windows or tabs
+in one process gets the title of its focused window, and requests from inside
+tmux or screen get no title.
 
 ## How it works
 
@@ -125,8 +163,9 @@ unchanged.
 - SSH agents with their own dialogs (gnome-keyring, KDE Wallet, 1Password) never
   call `SSH_ASKPASS`.
 - The context is informational, not a security boundary: a malicious local
-  process running as you can choose its own command line, and the commit
-  subject is read from git's message file, not from the bytes gpg signs.
+  process running as you can choose its own command line and window title, and
+  the commit subject is read from git's message file, not from the bytes gpg
+  signs.
 
 ## Uninstall
 
