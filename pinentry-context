@@ -123,6 +123,111 @@ def describe(pid, conf=None):
     return "\n".join(lines)
 
 
+GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                       "--config-env", "--super-prefix"}
+GIT_MSG_FILES = {"commit": "COMMIT_EDITMSG", "tag": "TAG_EDITMSG"}
+MSG_MAX_AGE = 60        # seconds; older message files belong to an earlier run
+SUBJECT_MAX = 100
+
+
+def git_subcommand(argv):
+    """Return (subcommand, its arguments) for a git command line."""
+    i = 1
+    while i < len(argv):
+        if argv[i] in GIT_OPTS_WITH_VALUE:
+            i += 2
+        elif argv[i].startswith("-"):
+            i += 1
+        else:
+            return argv[i], argv[i + 1:]
+    return None, []
+
+
+def find_git_dir(pid, cwd):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for item in f.read().split(b"\0"):
+                if item.startswith(b"GIT_DIR="):
+                    return os.path.join(cwd, os.fsdecode(item[8:]))
+    except OSError:
+        pass
+    path = cwd
+    while True:
+        dotgit = os.path.join(path, ".git")
+        if os.path.isdir(dotgit):
+            return dotgit
+        if os.path.isfile(dotgit):          # worktree / submodule: "gitdir: <path>"
+            with open(dotgit) as f:
+                first = f.readline().strip()
+            if first.startswith("gitdir:"):
+                return os.path.join(path, first[7:].strip())
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def clean_subject(text):
+    for line in text.splitlines():
+        line = "".join(c for c in line if c.isprintable()).strip()
+        if line and not line.startswith("#"):
+            return line if len(line) <= SUBJECT_MAX else line[:SUBJECT_MAX - 1] + "…"
+    return None
+
+
+def git_message(sub, args, pid, cwd):
+    """Subject of the message git is about to sign, or None if unknown."""
+    import time
+    git_dir = find_git_dir(pid, cwd) if cwd else None
+    if git_dir:
+        path = os.path.join(git_dir, GIT_MSG_FILES[sub])
+        try:
+            if time.time() - os.stat(path).st_mtime < MSG_MAX_AGE:
+                with open(path, errors="replace") as f:
+                    subject = clean_subject(f.read(4096))
+                if subject:
+                    return subject
+        except OSError:
+            pass
+    # `git tag -m` writes no message file; fall back to the command line
+    for i, arg in enumerate(args):
+        if arg in ("-m", "--message") and i + 1 < len(args):
+            return clean_subject(args[i + 1])
+        if arg.startswith("--message="):
+            return clean_subject(arg[10:])
+        if arg.startswith("-m") and len(arg) > 2:
+            return clean_subject(arg[2:])
+    return None
+
+
+def git_headline(pid):
+    """One line saying what git is signing, if the requester is a git command.
+
+    Only meaningful for GPG requests: gpg is asked to sign by `git commit`,
+    `git tag`, or a command that creates commits (rebase, merge, ...).
+    """
+    for _ in range(MAX_DEPTH):
+        if pid <= 1:
+            break
+        try:
+            comm, ppid, _cmd, cwd = proc(pid)
+            if comm == "git":
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    argv = [os.fsdecode(a) for a in f.read().split(b"\0") if a]
+                sub, args = git_subcommand(argv)
+                if sub in GIT_MSG_FILES:
+                    subject = git_message(sub, args, pid, cwd)
+                    if subject:
+                        return f"Signing {sub}: “{subject}”"
+                    return f"Signing a git {sub} (message not available)"
+                if sub:
+                    return f"Signing for: git {sub}"
+        except (OSError, ValueError):
+            break
+        pid = ppid
+    return None
+
+
 def assuan_escape(text):
     return text.replace("%", "%25").replace("\r", "").replace("\n", "%0A").encode()
 
@@ -164,6 +269,12 @@ def run_pinentry(conf):
 
 def add_context(line, owner, conf):
     body = line.rstrip(b"\r\n")
+    try:
+        headline = git_headline(owner)
+    except Exception:
+        headline = None
+    if headline:                          # goes above gpg's own text
+        body = b"SETDESC " + assuan_escape(headline) + b"%0A%0A" + body[8:]
     room = 990 - len(body)                # Assuan lines are limited to 1000 bytes
     if room < 40:
         return line

@@ -17,6 +17,15 @@ Requested from: ~/projects/some-repo
         └ gpg --status-fd=2 -bsau 0123ABCD…  (481970)
 ```
 
+When the request comes from `git commit` or `git tag` signing with GPG, the
+subject of the message being signed is put at the top:
+
+```
+Signing commit: “fix typo”
+
+Please enter the passphrase to unlock the OpenPGP secret key: ...
+```
+
 It is one Python file with no dependencies. It does not replace your pinentry
 or askpass program; it only adds text to the prompt and hands over to them.
 
@@ -94,6 +103,12 @@ session.
   sits in front of the real pinentry, walks that PID's parents in `/proc`, and
   appends the result to the `SETDESC` line. Replies from the real pinentry go
   straight back to gpg-agent; the passphrase never passes through this script.
+- **Git commit messages:** if the GPG requester's chain contains `git commit` or
+  `git tag`, the subject is read from `COMMIT_EDITMSG` / `TAG_EDITMSG` in that
+  repository (or from `-m` on the command line), provided the file was written
+  within the last minute. Commands that sign without a fresh message file
+  (rebase, merge, cherry-pick) are shown as `Signing for: git rebase`. Other
+  GPG uses (decrypting, signing files, ...) get no headline.
 - **SSH:** ssh runs `$SSH_ASKPASS` as its own child, so the requester is simply
   the parent process. The wrapper appends the chain to the prompt and execs the
   real askpass.
@@ -110,7 +125,8 @@ unchanged.
 - SSH agents with their own dialogs (gnome-keyring, KDE Wallet, 1Password) never
   call `SSH_ASKPASS`.
 - The context is informational, not a security boundary: a malicious local
-  process running as you can choose its own command line.
+  process running as you can choose its own command line, and the commit
+  subject is read from git's message file, not from the bytes gpg signs.
 
 ## Uninstall
 
