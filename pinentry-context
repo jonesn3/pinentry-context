@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""pinentry-context: show *what is asking* in GPG and SSH passphrase popups.
+
+Modes
+  pinentry-context [pinentry args]
+      Pinentry proxy. Set as `pinentry-program` in gpg-agent.conf. Appends the
+      requesting process chain to the prompt, then defers to the real pinentry.
+
+  ssh-askpass-context PROMPT          (a symlink to this file)
+      SSH askpass wrapper. Point SSH_ASKPASS at the symlink. Appends the
+      requesting process chain to the prompt, then defers to the real askpass.
+
+  pinentry-context --describe PID
+      Print the context that would be shown for PID.
+
+Optional config: ~/.config/pinentry-context/config  (key = value)
+  pinentry = /usr/bin/pinentry-qt       real pinentry to run
+  askpass  = /usr/bin/ksshaskpass       real askpass to run
+  notify   = swaynag -t warning -m      command for "touch your security key"
+                                        notices; the message is appended
+  stop     = myterm, otherwise          extra process names to end the chain at
+"""
+import os
+import shlex
+import subprocess
+import sys
+
+PINENTRY_CANDIDATES = [
+    "/usr/bin/pinentry", "/usr/local/bin/pinentry", "/opt/homebrew/bin/pinentry",
+    "/usr/bin/pinentry-gnome3", "/usr/bin/pinentry-qt", "/usr/bin/pinentry-gtk-2",
+    "/usr/bin/pinentry-curses",
+]
+ASKPASS_CANDIDATES = [
+    "/usr/libexec/openssh/gnome-ssh-askpass",   # Fedora / RHEL
+    "/usr/lib/openssh/gnome-ssh-askpass",       # Debian / Ubuntu
+    "/usr/lib/ssh/gnome-ssh-askpass3",          # Arch
+    "/usr/bin/ksshaskpass",
+    "/usr/lib/ssh/ksshaskpass",
+    "/usr/bin/lxqt-openssh-askpass",
+    "/usr/lib/ssh/x11-ssh-askpass",
+    "/usr/libexec/openssh/ssh-askpass",
+    "/usr/lib/ssh/ssh-askpass",
+    "/usr/bin/ssh-askpass",
+]
+# Session/terminal processes: the chain is cut here, nothing above is useful.
+STOP = {
+    "systemd", "init", "login", "sshd", "sway", "Hyprland", "river", "niri",
+    "gnome-shell", "plasmashell", "kwin_wayland", "i3", "tmux: server", "screen",
+    "foot", "footclient", "alacritty", "kitty", "wezterm-gui", "ghostty",
+    "gnome-terminal-", "konsole", "xterm", "ptyxis", "kgx", "tilix", "terminator",
+}
+SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "nu"}
+MAX_DEPTH = 8
+
+
+def load_config():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    conf = {}
+    try:
+        with open(os.path.join(base, "pinentry-context", "config")) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    conf[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def find_backend(configured, candidates):
+    me = os.path.realpath(__file__)
+    for path in ([os.path.expanduser(configured)] if configured else []) + candidates:
+        if os.access(path, os.X_OK) and os.path.realpath(path) != me:
+            return path
+    return None
+
+
+def proc(pid):
+    with open(f"/proc/{pid}/stat") as f:
+        stat = f.read()
+    comm = stat[stat.index("(") + 1:stat.rindex(")")]
+    ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+    with open(f"/proc/{pid}/cmdline", "rb") as f:
+        cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = None
+    return comm, ppid, " ".join(cmd.split()) or comm, cwd
+
+
+def describe(pid, conf=None):
+    stop = set(STOP)
+    if conf and conf.get("stop"):
+        stop |= {s.strip() for s in conf["stop"].split(",") if s.strip()}
+    home = os.path.expanduser("~")
+    chain, cwd = [], None
+    while pid > 1 and len(chain) < MAX_DEPTH:
+        try:
+            comm, ppid, cmd, pcwd = proc(pid)
+        except (OSError, ValueError):
+            break
+        if comm in stop:
+            chain.append(f"[{comm}]")
+            break
+        if cwd is None:
+            cwd = pcwd
+        # "bash -c <long script>" wrappers are noise; keep them short
+        limit = 50 if comm in SHELLS else 90
+        if len(cmd) > limit:
+            cmd = cmd[:limit - 1] + "…"
+        chain.append(f"{cmd}  ({pid})")
+        pid = ppid
+    if not chain:
+        return "Requested by: unknown process"
+    if cwd and (cwd == home or cwd.startswith(home + "/")):
+        cwd = "~" + cwd[len(home):]
+    lines = [f"Requested from: {cwd or '?'}"]
+    # outermost first, the direct requester last
+    for depth, entry in enumerate(reversed(chain)):
+        lines.append("  " * depth + ("└ " if depth else "") + entry)
+    return "\n".join(lines)
+
+
+def assuan_escape(text):
+    return text.replace("%", "%25").replace("\r", "").replace("\n", "%0A").encode()
+
+
+def run_pinentry(conf):
+    real = find_backend(
+        os.environ.get("PINENTRY_CONTEXT_REAL") or conf.get("pinentry"),
+        PINENTRY_CANDIDATES)
+    if not real:
+        sys.stderr.write("pinentry-context: no real pinentry found\n")
+        sys.exit(1)
+    try:
+        # The child writes its replies straight to gpg-agent; only the
+        # agent -> pinentry direction passes through us.
+        child = subprocess.Popen([real] + sys.argv[1:], stdin=subprocess.PIPE)
+    except Exception:
+        os.execv(real, [real] + sys.argv[1:])
+    owner = None
+    try:
+        for line in sys.stdin.buffer:
+            try:
+                if line.startswith(b"OPTION owner="):
+                    owner = int(line[13:].split(b"/")[0].split()[0])
+                elif line.startswith(b"SETDESC ") and owner:
+                    line = add_context(line, owner, conf)
+            except Exception:
+                pass                      # never let decoration break a prompt
+            child.stdin.write(line)
+            child.stdin.flush()
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            child.stdin.close()
+        except OSError:
+            pass
+    sys.exit(child.wait())
+
+
+def add_context(line, owner, conf):
+    body = line.rstrip(b"\r\n")
+    room = 990 - len(body)                # Assuan lines are limited to 1000 bytes
+    if room < 40:
+        return line
+    extra = (b"%0A%0A" + assuan_escape(describe(owner, conf)))[:room]
+    extra = extra.decode(errors="ignore").encode()   # no split UTF-8 sequence
+    while b"%" in extra[-2:]:                        # no split %XX escape
+        extra = extra[:extra.rindex(b"%")]
+    return body + extra + b"\n"
+
+
+def run_askpass(conf):
+    prompt = sys.argv[1] if len(sys.argv) > 1 else "Enter passphrase"
+    try:
+        context = describe(os.getppid(), conf)
+    except Exception:
+        context = ""
+    # SSH_ASKPASS_PROMPT=none: an informational notice (e.g. "touch your
+    # security key"); ssh kills us when it is no longer needed.
+    if os.environ.get("SSH_ASKPASS_PROMPT") == "none" and conf.get("notify"):
+        cmd = shlex.split(conf["notify"])
+        requester = context.splitlines()[-1].strip(" └") if context else ""
+        os.execvp(cmd[0], cmd + [f"{prompt} — {requester}" if requester else prompt])
+    real = find_backend(
+        os.environ.get("SSH_ASKPASS_CONTEXT_REAL") or conf.get("askpass"),
+        ASKPASS_CANDIDATES)
+    if not real:
+        sys.stderr.write("pinentry-context: no real ssh-askpass found; "
+                         "set 'askpass' in the config file\n")
+        sys.exit(1)
+    os.execv(real, [real, f"{prompt}\n\n{context}" if context else prompt])
+
+
+def main():
+    conf = load_config()
+    if len(sys.argv) == 3 and sys.argv[1] == "--describe":
+        print(describe(int(sys.argv[2]), conf))
+    elif "askpass" in os.path.basename(sys.argv[0]):
+        run_askpass(conf)
+    else:
+        run_pinentry(conf)
+
+
+if __name__ == "__main__":
+    main()
