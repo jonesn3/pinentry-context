@@ -19,8 +19,9 @@ Optional config: ~/.config/pinentry-context/config  (key = value)
   notify   = swaynag -t warning -m      command for "touch your security key"
                                         notices; the message is appended
   stop     = myterm, otherwise          extra process names to end the chain at
-  title_command = my-title-script       prints the window title for the pids
-                                        given as arguments (nearest first)
+  title_command = my-title-script       prints the window title (and optionally
+                                        the workspace on a second line) for the
+                                        pids given as arguments (nearest first)
 """
 import os
 import shlex
@@ -121,9 +122,11 @@ def describe(pid, conf=None):
     if cwd and (cwd == home or cwd.startswith(home + "/")):
         cwd = "~" + cwd[len(home):]
     lines = []
-    title = window_title(pids, conf)
+    title, workspace = window_info(pids, conf)
     if title:
         lines.append(f"Window: {title}")
+    if workspace:
+        lines.append(f"Workspace: {workspace}")
     lines.append(f"Requested from: {cwd or '?'}")
     # outermost first, the direct requester last
     for depth, entry in enumerate(reversed(chain)):
@@ -141,10 +144,11 @@ def describe(pid, conf=None):
 #       ...
 #
 # `pids` is the requesting process chain, nearest first, ending at the terminal
-# (or wherever the chain stopped). Return the window title as a string, or None
-# if this provider does not apply (other desktop, no matching window). Providers
+# (or wherever the chain stopped). Return the window title as a string, or a
+# (title, workspace) tuple if the desktop has named workspaces, or None if this
+# provider does not apply (other desktop, no matching window). Providers
 # are tried in order; exceptions count as "does not apply", so an unsupported
-# desktop simply gets no "Window:" line. Keep them fast (<1s): the passphrase
+# desktop simply gets no "Window:" / "Workspace:" lines. Keep them fast (<1s): the passphrase
 # prompt waits for them.
 
 TITLE_PROVIDERS = []
@@ -157,33 +161,41 @@ def title_provider(func):
     return func
 
 
-def window_title(pids, conf):
-    """Title of the window the request comes from, or None."""
-    def clean(title):
-        title = "".join(c for c in (title or "") if c.isprintable()).strip()
-        if len(title) > TITLE_MAX:
-            title = title[:TITLE_MAX - 1] + "…"
-        return title or None
+def window_info(pids, conf):
+    """(title, workspace) of the window the request comes from; either may be None."""
+    def clean(text):
+        text = "".join(c for c in (text or "") if c.isprintable()).strip()
+        if len(text) > TITLE_MAX:
+            text = text[:TITLE_MAX - 1] + "…"
+        return text or None
+
+    def result(found):
+        if isinstance(found, str):
+            found = (found, None)
+        title, workspace = (tuple(found) + (None, None))[:2]
+        return clean(title), clean(workspace)
 
     if conf.get("title_command"):       # user hook: gets the pids as arguments
         try:
             out = subprocess.run(
                 shlex.split(conf["title_command"]) + [str(p) for p in pids],
                 capture_output=True, text=True, timeout=TITLE_TIMEOUT,
-                stdin=subprocess.DEVNULL).stdout
-            title = clean(out.split("\n", 1)[0])
+                stdin=subprocess.DEVNULL).stdout.split("\n")
+            title, workspace = result((out[0], out[1] if len(out) > 1 else None))
             if title:
-                return title
+                return title, workspace
         except Exception:
             pass
     for provider in TITLE_PROVIDERS:
         try:
-            title = clean(provider(pids))
-            if title:
-                return title
+            found = provider(pids)
+            if found:
+                title, workspace = result(found)
+                if title:
+                    return title, workspace
         except Exception:
             pass
-    return None
+    return None, None
 
 
 @title_provider
@@ -216,14 +228,16 @@ def sway_title(pids):
         length = struct.unpack("=II", read(sock, 14)[6:])[0]
         tree = json.loads(read(sock, length))
 
-    windows = {}                        # pid -> title (focused one wins)
+    windows = {}                        # pid -> (title, workspace); focused wins
 
-    def walk(node):
+    def walk(node, workspace=None):
+        if node.get("type") == "workspace":
+            workspace = node.get("name")
         pid, name = node.get("pid"), node.get("name")
         if pid and name and (pid not in windows or node.get("focused")):
-            windows[pid] = name
+            windows[pid] = (name, workspace)
         for child in node.get("nodes", []) + node.get("floating_nodes", []):
-            walk(child)
+            walk(child, workspace)
 
     walk(tree)
     for pid in pids:                    # nearest process that owns a window

@@ -10,6 +10,7 @@ passphrase blind or cancel something legitimate.
 Please enter the passphrase to unlock the OpenPGP secret key: ...
 
 Window: ◐ Fix typo in docs
+Workspace: 3
 Requested from: ~/projects/some-repo
 [kitty]
   └ bash  (4711)
@@ -102,27 +103,29 @@ session.
 
 ## Window titles
 
-The `Window:` line is the title of the window the request comes from, which
-helps when several terminals or agent sessions are open. It needs help from the
-window manager, so it is only shown where a lookup exists:
+The `Window:` and `Workspace:` lines say which window the request comes from,
+which helps when several terminals or agent sessions are open. They need help
+from the window manager, so they are only shown where a lookup exists:
 
 | Desktop | Status |
 |---|---|
 | sway | built in |
-| anything else | no `Window:` line, everything else works |
+| anything else | no `Window:` / `Workspace:` lines, everything else works |
 
 There are two ways to add another window manager or desktop:
 
 - **Without touching the code:** set `title_command` in the config file. The
   command is called with the requesting process IDs as arguments (nearest
   first, ending at the terminal) and prints the title on the first line of its
-  output. Print nothing if there is no match.
+  output, optionally followed by the workspace name on a second line. Print
+  nothing if there is no match.
 - **In the code:** add a provider next to `sway_title` in `pinentry-context`:
 
   ```python
   @title_provider
   def mywm_title(pids):
-      # return the title of the window owned by one of `pids`, or None
+      # return the title of the window owned by one of `pids`,
+      # or a (title, workspace) tuple, or None
       ...
   ```
 
